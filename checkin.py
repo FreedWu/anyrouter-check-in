@@ -419,7 +419,7 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 
 	print(f'[AUTH] {account_name}: Using auth method -> {auth_method}')
 
-	return run_check_in_requests(
+	return await run_check_in_requests(
 		all_cookies,
 		account,
 		account_name,
@@ -429,7 +429,7 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 	)
 
 
-def run_check_in_requests(
+async def run_check_in_requests(
 	all_cookies: dict,
 	account: AccountConfig,
 	account_name: str,
@@ -485,7 +485,9 @@ def run_check_in_requests(
 
 			# agentrouter 没有签到接口，额度只在登录鉴权回调里发放
 			if account.provider == 'agentrouter':
-				ok, message = agentrouter_oauth.relogin(client, account, provider_config.domain)
+				ok, message = await agentrouter_oauth.relogin(
+					client, account, provider_config.domain, use_proxy=use_proxy
+				)
 				print(f'[{"SUCCESS" if ok else "FAILED"}] {account_name}: {message}')
 				user_info_after = get_user_info(client, headers, user_info_url)
 				return ok, user_info_before, user_info_after
