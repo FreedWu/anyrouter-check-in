@@ -19,6 +19,7 @@ import httpx
 from cloakbrowser import launch_async
 from dotenv import load_dotenv
 
+from utils import agentrouter_oauth
 from utils.browser import (
 	BrowserLoginResult,
 	has_session_cookie,
@@ -87,6 +88,9 @@ def parse_cookies(cookies_data):
 	return {}
 
 
+WAF_COOKIE_ATTEMPTS = 3
+
+
 async def get_waf_cookies_with_browser(
 	account_name: str,
 	login_url: str,
@@ -94,16 +98,35 @@ async def get_waf_cookies_with_browser(
 	*,
 	use_proxy: bool = False,
 ):
-	"""使用浏览器获取 WAF cookies"""
+	"""使用浏览器获取 WAF cookies；代理抖动会让单次尝试失败，故重试。"""
+	for attempt in range(1, WAF_COOKIE_ATTEMPTS + 1):
+		waf_cookies = await _fetch_waf_cookies_once(account_name, login_url, required_cookies, use_proxy=use_proxy)
+		if waf_cookies:
+			return waf_cookies
+		if attempt < WAF_COOKIE_ATTEMPTS:
+			print(f'[WARN] {account_name}: WAF cookie attempt {attempt} failed, retrying...')
+			await asyncio.sleep(3)
+	return None
+
+
+async def _fetch_waf_cookies_once(
+	account_name: str,
+	login_url: str,
+	required_cookies: list[str],
+	*,
+	use_proxy: bool = False,
+):
+	"""单次获取 WAF cookies 的尝试"""
 	print(f'[PROCESSING] {account_name}: Starting browser to get WAF cookies...')
 
 	launch_kwargs: dict = {'headless': True}
 	proxy = get_playwright_proxy(use_proxy=use_proxy)
 	if proxy:
 		launch_kwargs['proxy'] = proxy
-	browser = await launch_async(**launch_kwargs)
 
+	browser = None
 	try:
+		browser = await launch_async(**launch_kwargs)
 		page = await browser.new_page()
 		await prepare_browser_page(page)
 		print(f'[PROCESSING] {account_name}: Access login page to get initial cookies...')
@@ -126,17 +149,17 @@ async def get_waf_cookies_with_browser(
 
 		if missing_cookies:
 			print(f'[FAILED] {account_name}: Missing WAF cookies: {missing_cookies}')
-			await browser.close()
 			return None
 
 		print(f'[SUCCESS] {account_name}: Successfully got all WAF cookies')
-		await browser.close()
 		return waf_cookies
 
 	except Exception as e:
 		print(f'[FAILED] {account_name}: Error occurred while getting WAF cookies: {e}')
-		await browser.close()
 		return None
+	finally:
+		if browser is not None:
+			await browser.close()
 
 
 async def login_with_credentials(
@@ -459,6 +482,13 @@ def run_check_in_requests(
 				success = execute_check_in(client, account_name, provider_config, headers)
 				user_info_after = get_user_info(client, headers, user_info_url)
 				return success, user_info_before, user_info_after
+
+			# agentrouter 没有签到接口，额度只在登录鉴权回调里发放
+			if account.provider == 'agentrouter':
+				ok, message = agentrouter_oauth.relogin(client, account, provider_config.domain)
+				print(f'[{"SUCCESS" if ok else "FAILED"}] {account_name}: {message}')
+				user_info_after = get_user_info(client, headers, user_info_url)
+				return ok, user_info_before, user_info_after
 
 			user_info_after = get_user_info(client, headers, user_info_url)
 			if user_info_after and user_info_after.get('success'):
