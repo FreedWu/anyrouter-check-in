@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import time
 from urllib.parse import parse_qs, urlencode, urlparse
 
 import httpx
@@ -19,6 +20,8 @@ LINUXDO_CALLBACK_PATH = '/oauth/linuxdo'
 CF_WAIT_ROUNDS = 20
 CF_WAIT_MS = 2000
 GOTO_ATTEMPTS = 3
+RATE_LIMIT_ATTEMPTS = 4
+RATE_LIMIT_BACKOFF_SECONDS = 10
 
 
 def extract_code(location: str | None) -> str | None:
@@ -144,9 +147,28 @@ async def relogin(client: httpx.Client, account, domain: str, *, use_proxy: bool
 	else:
 		return False, '未配置 github_session 或 linuxdo_session，无法触发 AgentRouter 发奖'
 
+	# 带上旧 session 取 state 会被服务端判为「state is empty or not same」，OAuth 交换必须用干净会话
+	saved = list(client.cookies.jar)
+	client.cookies.clear()
+	try:
+		body = await _exchange(client, account, domain, provider, use_proxy=use_proxy)
+	finally:
+		fresh = list(client.cookies.jar)
+		client.cookies.clear()
+		for cookie in saved + fresh:  # 回调新种的 session 覆盖旧的
+			client.cookies.jar.set_cookie(cookie)
+
+	if not body.get('success'):
+		return False, body.get('message', 'OAuth 回调登录失败')
+
+	checked_in = bool((body.get('data') or {}).get('checked_in'))
+	return True, '签到成功，额度已到账' if checked_in else '登录成功，今日已签到'
+
+
+async def _exchange(client: httpx.Client, account, domain: str, provider: str, *, use_proxy: bool) -> dict:
 	# client_id 由平台自己发布，不写死
-	status = client.get(f'{domain}/api/status').json().get('data') or {}
-	state = client.get(f'{domain}/api/oauth/state', params={'mode': 'login'}).json()['data']
+	status = _get_json(client, f'{domain}/api/status').get('data') or {}
+	state = _get_json(client, f'{domain}/api/oauth/state', params={'mode': 'login'})['data']
 
 	if provider == 'github':
 		code = _authorize(
@@ -163,9 +185,18 @@ async def relogin(client: httpx.Client, account, domain: str, *, use_proxy: bool
 			use_proxy=use_proxy,
 		)
 
-	body = client.get(f'{domain}/api/oauth/{provider}', params={'code': code, 'state': state, 'mode': 'login'}).json()
-	if not body.get('success'):
-		return False, body.get('message', 'OAuth 回调登录失败')
+	return _get_json(client, f'{domain}/api/oauth/{provider}', params={'code': code, 'state': state, 'mode': 'login'})
 
-	checked_in = bool((body.get('data') or {}).get('checked_in'))
-	return True, '签到成功，额度已到账' if checked_in else '登录成功，今日已签到'
+
+def _get_json(client: httpx.Client, url: str, *, params: dict | None = None) -> dict:
+	"""取 JSON；429 是 AgentRouter 的限流，退避重试几次。"""
+	for attempt in range(RATE_LIMIT_ATTEMPTS):
+		response = client.get(url, params=params)
+		if response.status_code != 429:
+			response.raise_for_status()
+			return response.json()
+		if attempt == RATE_LIMIT_ATTEMPTS - 1:
+			raise RuntimeError(f'AgentRouter 限流（429），稍后重试：{url}')
+		time.sleep(RATE_LIMIT_BACKOFF_SECONDS * (attempt + 1))
+	return {}
+
