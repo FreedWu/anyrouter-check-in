@@ -9,6 +9,7 @@ __pycache__
 coverage.xml
 htmlcov
 balance_hash.txt
+linuxdo_sessions.json
 .browser_profiles
 checkin_screenshots
 

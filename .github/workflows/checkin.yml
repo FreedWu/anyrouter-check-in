@@ -72,6 +72,16 @@ jobs:
           balance-hash-${{ github.ref_name }}-
           balance-hash-
 
+    # linux.do 每次授权会轮换 _t，checkin.py 把刷新值写进这个文件；缓存只在 job 成功时保存
+    - name: 恢复 LinuxDO 会话缓存
+      uses: actions/cache@v5
+      with:
+        path: linuxdo_sessions.json
+        key: linuxdo-sessions-${{ github.ref_name }}-${{ github.run_id }}
+        restore-keys: |
+          linuxdo-sessions-${{ github.ref_name }}-
+          linuxdo-sessions-
+
     - name: 恢复浏览器 Profile 缓存
       uses: actions/cache@v5
       with:

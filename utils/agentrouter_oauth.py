@@ -5,7 +5,10 @@
 
 from __future__ import annotations
 
+import json
+import os
 import time
+from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlparse
 
 import httpx
@@ -17,6 +20,7 @@ from utils.proxy import get_playwright_proxy
 GITHUB_AUTHORIZE = 'https://github.com/login/oauth/authorize'
 LINUXDO_AUTHORIZE = 'https://connect.linux.do/oauth2/authorize'
 LINUXDO_CALLBACK_PATH = '/oauth/linuxdo'
+LINUXDO_SESSION_FILE = 'linuxdo_sessions.json'
 CF_WAIT_ROUNDS = 20
 CF_WAIT_MS = 2000
 GOTO_ATTEMPTS = 3
@@ -56,6 +60,58 @@ def parse_cookie_string(cookie_str: str) -> dict[str, str]:
 	return pairs
 
 
+def _session_file() -> Path:
+	return Path(os.getenv('CHECKIN_STATE_DIR', '.')).resolve() / LINUXDO_SESSION_FILE
+
+
+def _account_key(account) -> str:
+	return str(account.api_user or account.name or 'default')
+
+
+def load_linuxdo_session(account) -> str | None:
+	"""读取上次运行刷新后的 linux.do cookie；配置里的 cookie 改过则忽略旧记录。"""
+	try:
+		data = json.loads(_session_file().read_text(encoding='utf-8'))
+	except (OSError, ValueError):
+		return None
+	entry = data.get(_account_key(account)) if isinstance(data, dict) else None
+	if not isinstance(entry, dict) or entry.get('source') != account.linuxdo_session:
+		return None
+	value = entry.get('session')
+	return value if isinstance(value, str) and value else None
+
+
+def save_linuxdo_session(account, cookie_str: str) -> None:
+	"""linux.do 每次授权都会轮换 _t，把浏览器里的新 cookie 存下来给下次用。"""
+	path = _session_file()
+	try:
+		data = json.loads(path.read_text(encoding='utf-8'))
+	except (OSError, ValueError):
+		data = {}
+	if not isinstance(data, dict):
+		data = {}
+	data[_account_key(account)] = {'source': account.linuxdo_session, 'session': cookie_str}
+	path.parent.mkdir(parents=True, exist_ok=True)
+	path.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding='utf-8')
+	print(f'[INFO] {account.name or _account_key(account)}: LinuxDO 会话已刷新并保存到 {path.name}')
+
+
+def _cookies_to_string(cookies: list[dict]) -> str:
+	"""把浏览器里 linux.do 域下的 cookie 拼回 "name=value; ..."，同名优先父域。"""
+	picked: dict[str, str] = {}
+	domains: dict[str, str] = {}
+	for cookie in cookies:
+		name = cookie.get('name')
+		value = cookie.get('value')
+		domain = str(cookie.get('domain', ''))
+		if not name or not value or not domain.endswith('linux.do'):
+			continue
+		if name not in picked or (domain.startswith('.') and not domains[name].startswith('.')):
+			picked[name] = value
+			domains[name] = domain
+	return '; '.join(f'{name}={value}' for name, value in picked.items())
+
+
 async def _goto_with_retry(page, url: str) -> None:
 	for attempt in range(GOTO_ATTEMPTS):
 		try:
@@ -79,8 +135,11 @@ async def _wait_out_challenge(page) -> None:
 		await page.wait_for_timeout(CF_WAIT_MS)
 
 
-async def _authorize_linuxdo(params: dict, session: str, *, use_proxy: bool) -> str:
-	"""connect.linux.do 有 Cloudflare 挑战，httpx 一律 403，只能让浏览器过挑战拿 code。"""
+async def _authorize_linuxdo(params: dict, session: str, *, use_proxy: bool) -> tuple[str, str]:
+	"""connect.linux.do 有 Cloudflare 挑战，httpx 一律 403，只能让浏览器过挑战拿 code。
+
+	返回 (授权码, 浏览器里刷新后的 linux.do cookie)。
+	"""
 	launch_kwargs: dict = {'headless': True}
 	proxy = get_playwright_proxy(use_proxy=use_proxy)
 	if proxy:
@@ -121,7 +180,7 @@ async def _authorize_linuxdo(params: dict, session: str, *, use_proxy: bool) -> 
 		approved = False
 		for _ in range(CF_WAIT_ROUNDS):
 			if captured:
-				return captured[0]
+				return captured[0], _cookies_to_string(await context.cookies())
 			# 首次授权要点头「允许」，之后会话记住了授权就直接跳回调
 			if not approved:
 				approve = page.locator('a[href*="/oauth2/approve/"]')
@@ -132,7 +191,7 @@ async def _authorize_linuxdo(params: dict, session: str, *, use_proxy: bool) -> 
 			if page.url.startswith('https://linux.do/login'):
 				raise RuntimeError('LinuxDO 会话已失效（被跳回登录页），请重新取 _t')
 		if captured:
-			return captured[0]
+			return captured[0], _cookies_to_string(await context.cookies())
 		raise RuntimeError(f'LinuxDO 未返回授权码（最终停在 {page.url[:60]}）')
 	finally:
 		await browser.close()
@@ -142,16 +201,18 @@ async def relogin(client: httpx.Client, account, domain: str, *, use_proxy: bool
 	"""静默重登录一次，触发服务端发放当日额度。"""
 	if account.github_session:
 		provider = 'github'
-	elif account.linuxdo_session:
-		provider = 'linuxdo'
+		linuxdo_session = None
 	else:
-		return False, '未配置 github_session 或 linuxdo_session，无法触发 AgentRouter 发奖'
+		linuxdo_session = load_linuxdo_session(account) or account.linuxdo_session
+		if not linuxdo_session:
+			return False, '未配置 github_session 或 linuxdo_session，无法触发 AgentRouter 发奖'
+		provider = 'linuxdo'
 
 	# 带上旧 session 取 state 会被服务端判为「state is empty or not same」，OAuth 交换必须用干净会话
 	saved = list(client.cookies.jar)
 	client.cookies.clear()
 	try:
-		body = await _exchange(client, account, domain, provider, use_proxy=use_proxy)
+		body = await _exchange(client, account, domain, provider, linuxdo_session, use_proxy=use_proxy)
 	finally:
 		fresh = list(client.cookies.jar)
 		client.cookies.clear()
@@ -165,7 +226,15 @@ async def relogin(client: httpx.Client, account, domain: str, *, use_proxy: bool
 	return True, '签到成功，额度已到账' if checked_in else '登录成功，今日已签到'
 
 
-async def _exchange(client: httpx.Client, account, domain: str, provider: str, *, use_proxy: bool) -> dict:
+async def _exchange(
+	client: httpx.Client,
+	account,
+	domain: str,
+	provider: str,
+	linuxdo_session: str | None,
+	*,
+	use_proxy: bool,
+) -> dict:
 	# client_id 由平台自己发布，不写死
 	status = _get_json(client, f'{domain}/api/status').get('data') or {}
 	state = _get_json(client, f'{domain}/api/oauth/state', params={'mode': 'login'})['data']
@@ -179,11 +248,13 @@ async def _exchange(client: httpx.Client, account, domain: str, provider: str, *
 			'GitHub',
 		)
 	else:
-		code = await _authorize_linuxdo(
+		code, refreshed = await _authorize_linuxdo(
 			{'response_type': 'code', 'client_id': status['linuxdo_client_id'], 'state': state},
-			account.linuxdo_session,
+			linuxdo_session or '',
 			use_proxy=use_proxy,
 		)
+		if refreshed:
+			save_linuxdo_session(account, refreshed)
 
 	return _get_json(client, f'{domain}/api/oauth/{provider}', params={'code': code, 'state': state, 'mode': 'login'})
 
@@ -199,4 +270,3 @@ def _get_json(client: httpx.Client, url: str, *, params: dict | None = None) -> 
 			raise RuntimeError(f'AgentRouter 限流（429），稍后重试：{url}')
 		time.sleep(RATE_LIMIT_BACKOFF_SECONDS * (attempt + 1))
 	return {}
-
